@@ -25,8 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("render-audio-bot")
 
-BOT_TOKEN = os.getenv("8459100080:AAHfqLlNhfhdy4B09q_2ZH-8AP0DWN6I-wQ", "").strip()
-RENDER_EXTERNAL_URL = os.getenv("https://dashboard.render.com/web/srv-d79ugs0ule4c73avfr6g/events", "").strip().rstrip("/")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "48"))
