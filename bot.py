@@ -14,6 +14,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    Defaults,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -169,7 +170,6 @@ async def stream_download_file(url: str, output_path: Path, max_size: int) -> in
 async def download_with_ytdlp(url: str, output_path: Path, max_size: int) -> tuple[int, str]:
     """
     Универсальный загрузчик для SoundCloud / Яндекс.Музыки через yt-dlp.
-    yt-dlp сам разруливает форматы и API сервисов.
     """
     ydl_opts = {
         "format": "bestaudio/best",
@@ -309,16 +309,17 @@ def build_ptb_app() -> Application:
         pool_timeout=POOL_TIMEOUT,
     )
 
-    # Ручная сборка Application без Updater / ApplicationBuilder.build()
     bot = Bot(token=BOT_TOKEN, request=request)
+    defaults = Defaults()
+
+    # В v20.8 используем только поддерживаемые аргументы конструктора
     app = Application(
         bot=bot,
         update_queue=None,
         persistence=None,
-        arbitrary_callback_data=False,
+        defaults=defaults,
         context_types=ContextTypes.DEFAULT_TYPE,
         post_init=None,
-        request=request,
     )
 
     app.add_handler(CommandHandler("start", start))
