@@ -8,13 +8,13 @@ from uuid import uuid4
 
 import httpx
 from aiohttp import web
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    Defaults,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -309,14 +309,11 @@ def build_ptb_app() -> Application:
         pool_timeout=POOL_TIMEOUT,
     )
 
-    bot = Bot(token=BOT_TOKEN, request=request)
-
-    # Минимальный поддерживаемый конструктор для v20.8
-    app = Application(
-        bot=bot,
-        update_queue=None,
-        persistence=None,
-        context_types=ContextTypes.DEFAULT_TYPE,
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .build()
     )
 
     app.add_handler(CommandHandler("start", start))
