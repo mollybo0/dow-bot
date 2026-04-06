@@ -310,16 +310,13 @@ def build_ptb_app() -> Application:
     )
 
     bot = Bot(token=BOT_TOKEN, request=request)
-    defaults = Defaults()
 
-    # В v20.8 используем только поддерживаемые аргументы конструктора
+    # Минимальный поддерживаемый конструктор для v20.8
     app = Application(
         bot=bot,
         update_queue=None,
         persistence=None,
-        defaults=defaults,
         context_types=ContextTypes.DEFAULT_TYPE,
-        post_init=None,
     )
 
     app.add_handler(CommandHandler("start", start))
