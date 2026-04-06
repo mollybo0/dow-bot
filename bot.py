@@ -18,6 +18,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
+import yt_dlp  # нужен в requirements.txt
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +61,7 @@ def make_uid() -> str:
 def escape_md(text: str) -> str:
     if not text:
         return ""
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
+    return re.sub(r"([_*[\]()~`>#+\-=|{}.!])", r"\\\1", text)
 
 
 def is_url(text: str) -> bool:
@@ -74,6 +75,15 @@ def get_extension_from_url(url: str) -> str:
 
 def is_direct_audio_url(url: str) -> bool:
     return get_extension_from_url(url) in ALLOWED_AUDIO_EXTENSIONS
+
+
+def is_soundcloud_url(url: str) -> bool:
+    return "soundcloud.com" in url.lower()
+
+
+def is_yandex_music_url(url: str) -> bool:
+    u = url.lower()
+    return "music.yandex.ru" in u or "yandex.ru/music" in u or "ya.ru/music" in u
 
 
 def format_size(num_bytes: int) -> str:
@@ -156,18 +166,49 @@ async def stream_download_file(url: str, output_path: Path, max_size: int) -> in
     return downloaded
 
 
+async def download_with_ytdlp(url: str, output_path: Path, max_size: int) -> tuple[int, str]:
+    """
+    Универсальный загрузчик для SoundCloud / Яндекс.Музыки через yt-dlp.
+    yt-dlp сам разруливает все форматы и API обоих сервисов.
+    """
+    # yt-dlp сам скачивает в файл, но мы хотим контроль размера → качаем по direct-url через httpx
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+
+    loop = asyncio.get_running_loop()
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+
+    title = sanitize_filename(info.get("title") or "Track")
+    direct_url = info.get("url")
+    if not direct_url:
+        raise ValueError("yt-dlp не вернул прямую ссылку на аудио")
+
+    downloaded = await stream_download_file(direct_url, output_path, max_size)
+    return downloaded, title
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Привет.\n\n"
-        "Отправь прямую ссылку на аудиофайл:\n"
-        "mp3, m4a, aac, ogg, wav, flac, opus."
+        "Отправь ссылку:\n"
+        "• Прямой аудиофайл (.mp3, .m4a, .aac, .ogg, .wav, .flac, .opus)\n"
+        "• Трек с SoundCloud\n"
+        "• Трек с Яндекс.Музыки"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"Поддерживаются только прямые ссылки на аудиофайлы.\n"
-        f"Лимит файла: {MAX_FILE_SIZE_MB} MB."
+        f"✅ Поддерживается:\n"
+        f"• Прямые ссылки на аудиофайлы (.mp3, .m4a, .aac, .ogg, .wav, .flac, .opus)\n"
+        f"• SoundCloud треки\n"
+        f"• Яндекс.Музыка треки\n\n"
+        f"⚠️ Лимит файла: {MAX_FILE_SIZE_MB} MB."
     )
 
 
@@ -180,40 +221,51 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     url = update.message.text.strip()
-
     if not is_url(url):
-        await update.message.reply_text("Пришли прямую http/https ссылку на аудиофайл.")
+        await update.message.reply_text("Пришли http/https ссылку на аудио или трек.")
         return
 
-    if not is_direct_audio_url(url):
-        await update.message.reply_text(
-            "Поддерживаются только прямые ссылки на аудиофайлы "
-            "(.mp3, .m4a, .aac, .ogg, .wav, .flac, .opus)."
-        )
-        return
-
-    status_msg = await update.message.reply_text("🔍 Проверяю ссылку...")
+    status_msg = await update.message.reply_text("🔍 Анализирую ссылку...")
 
     try:
-        size, _ = await fetch_head_info(url)
-        if size is not None and size > MAX_FILE_SIZE:
+        # Прямой файл
+        if is_direct_audio_url(url):
+            filename = choose_filename_from_url(url)
+            tmp_path = DOWNLOAD_DIR / f"{make_uid()}_{filename}"
+
+            await safe_edit(status_msg, "📥 Скачиваю прямой файл...")
+            size, _ = await fetch_head_info(url)
+            if size is not None and size > MAX_FILE_SIZE:
+                await safe_edit(
+                    status_msg,
+                    f"❌ Файл слишком большой: *{escape_md(format_size(size))}*\n\n"
+                    f"Лимит: *{escape_md(format_size(MAX_FILE_SIZE))}*",
+                )
+                return
+
+            downloaded = await stream_download_file(url, tmp_path, MAX_FILE_SIZE)
+            title = sanitize_filename(Path(filename).stem)
+
+        # SC / ЯМ через yt-dlp
+        elif is_soundcloud_url(url) or is_yandex_music_url(url):
+            filename = f"yt_{make_uid()}.m4a"
+            tmp_path = DOWNLOAD_DIR / filename
+            await safe_edit(status_msg, "🎵 Получаю трек через yt-dlp...")
+            downloaded, title = await download_with_ytdlp(url, tmp_path, MAX_FILE_SIZE)
+
+        else:
             await safe_edit(
                 status_msg,
-                f"❌ Файл слишком большой: *{escape_md(format_size(size))}*\n\n"
-                f"Лимит: *{escape_md(format_size(MAX_FILE_SIZE))}*",
+                "❌ Пока поддерживаются только:\n"
+                "• Прямые аудиофайлы\n"
+                "• SoundCloud\n"
+                "• Яндекс.Музыка"
             )
             return
 
-        filename = choose_filename_from_url(url)
-        tmp_path = DOWNLOAD_DIR / f"{make_uid()}_{filename}"
-
-        await safe_edit(status_msg, "⏳ Скачиваю файл...")
-        downloaded = await stream_download_file(url, tmp_path, MAX_FILE_SIZE)
-
-        title = sanitize_filename(Path(filename).stem)
         await safe_edit(
             status_msg,
-            f"📤 Отправляю: *{escape_md(title)}*\n\n"
+            f"📤 Отправляю: *{escape_md(title)}*\n"
             f"Размер: *{escape_md(format_size(downloaded))}*"
         )
 
@@ -286,7 +338,7 @@ async def telegram_webhook(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def on_startup(aio_app: web.Application) -> None:
+async def on_startup(aio_app: web.Application) -> web.Response:
     logger.info("Starting app...")
     logger.info("PORT=%s", PORT)
     logger.info("BOT_TOKEN set=%s", bool(BOT_TOKEN))
@@ -309,9 +361,10 @@ async def on_startup(aio_app: web.Application) -> None:
     logger.info("Setting webhook to %s", webhook_url)
     await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
     logger.info("Webhook set successfully")
+    return web.json_response({"ok": True})
 
 
-async def on_shutdown(aio_app: web.Application) -> None:
+async def on_shutdown(aio_app: web.Application) -> web.Response:
     logger.info("Shutting down...")
     ptb_app: Application = aio_app["ptb_app"]
     try:
@@ -320,6 +373,7 @@ async def on_shutdown(aio_app: web.Application) -> None:
         logger.exception("Failed deleting webhook")
     await ptb_app.stop()
     await ptb_app.shutdown()
+    return web.json_response({"ok": True})
 
 
 def create_web_app() -> web.Application:
