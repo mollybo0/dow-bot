@@ -313,7 +313,7 @@ def build_ptb_app() -> Application:
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .request(request)
-        .get_updates_request(request)
+        # НИЧЕГО больше тут не добавляем, особенно .get_updates_request()
         .build()
     )
 
