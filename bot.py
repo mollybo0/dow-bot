@@ -18,9 +18,14 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-import yt_dlp  # не забудь добавить в requirements.txt
+import yt_dlp
 
-logger.info("Booting service... v2")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("render-audio-bot")
+logger.info("Booting service... v2")  # <-- здесь уже logger есть
 
 logging.basicConfig(
     level=logging.INFO,
