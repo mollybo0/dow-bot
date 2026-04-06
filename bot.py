@@ -25,7 +25,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("render-audio-bot")
-logger.info("Booting service... v2")
+logger.info("Booting service... v3")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
@@ -110,7 +110,7 @@ async def safe_edit(msg, text: str) -> None:
     try:
         await msg.edit_text(text, parse_mode="Markdown")
     except Exception:
-        pass
+        logger.exception("safe_edit failed")
 
 
 async def fetch_head_info(url: str):
@@ -128,6 +128,7 @@ async def fetch_head_info(url: str):
             size = int(content_length) if content_length and content_length.isdigit() else None
             return size, content_type
         except Exception:
+            logger.exception("HEAD request failed for %s", url)
             return None, None
 
 
@@ -168,9 +169,6 @@ async def stream_download_file(url: str, output_path: Path, max_size: int) -> in
 
 
 async def download_with_ytdlp(url: str, output_path: Path, max_size: int) -> tuple[int, str]:
-    """
-    Универсальный загрузчик для SoundCloud / Яндекс.Музыки через yt-dlp.
-    """
     ydl_opts = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -178,6 +176,7 @@ async def download_with_ytdlp(url: str, output_path: Path, max_size: int) -> tup
         "skip_download": True,
     }
 
+    logger.info("Running yt-dlp for %s", url)
     loop = asyncio.get_running_loop()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
@@ -187,11 +186,15 @@ async def download_with_ytdlp(url: str, output_path: Path, max_size: int) -> tup
     if not direct_url:
         raise ValueError("yt-dlp не вернул прямую ссылку на аудио")
 
+    logger.info("yt-dlp extracted title=%s", title)
     downloaded = await stream_download_file(direct_url, output_path, max_size)
     return downloaded, title
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
     await update.message.reply_text(
         "Привет.\n\n"
         "Отправь ссылку:\n"
@@ -202,6 +205,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
     await update.message.reply_text(
         f"✅ Поддерживается:\n"
         f"• Прямые ссылки на аудиофайлы (.mp3, .m4a, .aac, .ogg, .wav, .flac, .opus)\n"
@@ -212,6 +218,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     await update.message.reply_text("pong")
 
 
@@ -220,20 +228,25 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     url = update.message.text.strip()
+    logger.info("Received URL: %s", url)
+
     if not is_url(url):
         await update.message.reply_text("Пришли http/https ссылку на аудио или трек.")
         return
 
     status_msg = await update.message.reply_text("🔍 Анализирую ссылку...")
+    tmp_path = None
 
     try:
-        # Прямой файл
         if is_direct_audio_url(url):
+            logger.info("Detected direct audio URL")
             filename = choose_filename_from_url(url)
             tmp_path = DOWNLOAD_DIR / f"{make_uid()}_{filename}"
 
             await safe_edit(status_msg, "📥 Скачиваю прямой файл...")
-            size, _ = await fetch_head_info(url)
+            size, content_type = await fetch_head_info(url)
+            logger.info("HEAD info: size=%s content_type=%s", size, content_type)
+
             if size is not None and size > MAX_FILE_SIZE:
                 await safe_edit(
                     status_msg,
@@ -245,14 +258,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             downloaded = await stream_download_file(url, tmp_path, MAX_FILE_SIZE)
             title = sanitize_filename(Path(filename).stem)
 
-        # SC / ЯМ через yt-dlp
         elif is_soundcloud_url(url) or is_yandex_music_url(url):
+            logger.info("Detected supported yt-dlp URL")
             filename = f"yt_{make_uid()}.m4a"
             tmp_path = DOWNLOAD_DIR / filename
+
             await safe_edit(status_msg, "🎵 Получаю трек через yt-dlp...")
             downloaded, title = await download_with_ytdlp(url, tmp_path, MAX_FILE_SIZE)
 
         else:
+            logger.info("Unsupported URL")
             await safe_edit(
                 status_msg,
                 "❌ Пока поддерживаются только:\n"
@@ -262,37 +277,44 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
+        logger.info("Download complete: title=%s size=%s", title, downloaded)
+
         await safe_edit(
             status_msg,
             f"📤 Отправляю: *{escape_md(title)}*\n"
             f"Размер: *{escape_md(format_size(downloaded))}*"
         )
 
-        try:
-            with tmp_path.open("rb") as f:
-                await update.message.reply_audio(
-                    audio=f,
-                    filename=tmp_path.name,
-                    title=title,
-                    performer="Audio bot",
-                    read_timeout=READ_TIMEOUT,
-                    write_timeout=WRITE_TIMEOUT,
-                    connect_timeout=CONNECT_TIMEOUT,
-                )
-        finally:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        with tmp_path.open("rb") as f:
+            await update.message.reply_audio(
+                audio=f,
+                filename=tmp_path.name,
+                title=title,
+                performer="Audio bot",
+                read_timeout=READ_TIMEOUT,
+                write_timeout=WRITE_TIMEOUT,
+                connect_timeout=CONNECT_TIMEOUT,
+            )
+
+        logger.info("Audio sent successfully")
 
         try:
             await status_msg.delete()
         except Exception:
-            pass
+            logger.exception("Failed to delete status message")
 
     except Exception as e:
         logger.exception("handle_link error")
-        await safe_edit(status_msg, f"❌ Ошибка: `{escape_md(str(e))}`")
+        try:
+            await safe_edit(status_msg, f"❌ Ошибка: `{escape_md(str(e))}`")
+        except Exception:
+            logger.exception("Failed to show error to user")
+    finally:
+        if tmp_path:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Failed to delete temp file: %s", tmp_path)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -332,7 +354,12 @@ async def telegram_webhook(request: web.Request) -> web.Response:
     ptb_app: Application = request.app["ptb_app"]
     data = await request.json()
     update = Update.de_json(data, ptb_app.bot)
-    await ptb_app.process_update(update)
+
+    logger.info("Webhook update received")
+
+    # Важно: не блокируем webhook долгой обработкой
+    asyncio.create_task(ptb_app.process_update(update))
+
     return web.json_response({"ok": True})
 
 
@@ -364,12 +391,21 @@ async def on_startup(aio_app: web.Application) -> None:
 async def on_shutdown(aio_app: web.Application) -> None:
     logger.info("Shutting down...")
     ptb_app: Application = aio_app["ptb_app"]
+
     try:
         await ptb_app.bot.delete_webhook()
     except Exception:
         logger.exception("Failed deleting webhook")
-    await ptb_app.stop()
-    await ptb_app.shutdown()
+
+    try:
+        await ptb_app.stop()
+    except Exception:
+        logger.exception("Failed stopping PTB app")
+
+    try:
+        await ptb_app.shutdown()
+    except Exception:
+        logger.exception("Failed shutting down PTB app")
 
 
 def create_web_app() -> web.Application:
