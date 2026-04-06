@@ -14,7 +14,7 @@ import httpx
 from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError, TimedOut, NetworkError, BadRequest
+from telegram.error import TelegramError, BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -31,9 +31,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("render-audio-bot")
-logger.info("Booting service... v5")
+logger.info("Booting service... final")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -54,7 +55,7 @@ DOWNLOAD_DIR = Path("./downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_AUDIO_EXTENSIONS = {
-    ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus"
+    ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus", ".webm"
 }
 
 AUDIO_MIME_HINTS = {
@@ -69,13 +70,13 @@ AUDIO_MIME_HINTS = {
     "audio/flac": ".flac",
     "audio/x-flac": ".flac",
     "audio/opus": ".opus",
-    "audio/webm": ".opus",
+    "audio/webm": ".webm",
 }
 
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
-def sanitize_filename(name: str, max_len: int = 120) -> str:
+def sanitize_filename(name: str, max_len: int = 160) -> str:
     if not name:
         return "audio"
     name = re.sub(r'[\\/*?:"<>|]+', "_", name)
@@ -276,6 +277,19 @@ async def detect_direct_audio(url: str) -> Tuple[bool, Optional[str], Optional[i
     return False, content_type, size
 
 
+def format_track_title(artist: Optional[str], track: Optional[str], fallback: str = "Unknown Artist - Unknown Track") -> str:
+    artist = (artist or "").strip()
+    track = (track or "").strip()
+
+    if artist and track:
+        return sanitize_filename(f"{artist} - {track}")
+    if track:
+        return sanitize_filename(track)
+    if artist:
+        return sanitize_filename(artist)
+    return sanitize_filename(fallback)
+
+
 async def stream_download_file(
     url: str,
     output_path: Path,
@@ -297,7 +311,7 @@ async def stream_download_file(
                         total = int(content_length)
                         if total > max_size:
                             raise ValueError(
-                                f"Файл получился слишком большим: {format_size(total)}. "
+                                f"Файл слишком большой: {format_size(total)}. "
                                 f"Лимит — {format_size(max_size)}."
                             )
 
@@ -330,62 +344,103 @@ async def stream_download_file(
 
 async def download_with_ytdlp(
     url: str,
-    output_path: Path,
+    output_dir: Path,
     max_size: int,
     progress_msg=None,
-) -> Tuple[int, str, Optional[str]]:
+) -> Tuple[Path, str, Optional[str], Optional[str]]:
     loop = asyncio.get_running_loop()
     throttler = ProgressThrottler(PROGRESS_EDIT_INTERVAL)
+    uid = make_uid()
+    outtmpl = str(output_dir / f"{uid}.%(ext)s")
 
-    async def update_stage(text: str):
+    async def update_stage(text: str, force: bool = False):
         if progress_msg:
-            await safe_edit(progress_msg, text, throttler=throttler)
+            await safe_edit(progress_msg, text, throttler=throttler, force=force)
+
+    def progress_hook(d):
+        if not progress_msg:
+            return
+
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes", 0)
+            filename = d.get("filename") or "Трек"
+            title = Path(filename).stem
+
+            text = render_progress_text(title, downloaded, total, "Скачиваю трек")
+            asyncio.run_coroutine_threadsafe(
+                safe_edit(progress_msg, text, throttler=throttler),
+                loop,
+            )
+
+        elif status == "finished":
+            filename = d.get("filename") or "Трек"
+            title = Path(filename).stem
+            text = (
+                f"✨ <b>Супер, файл уже у меня!</b>\n"
+                f"<b>{html_escape(title)}</b>\n\n"
+                "Осталось совсем чуть-чуть — подготавливаю отправку 🎧"
+            )
+            asyncio.run_coroutine_threadsafe(
+                safe_edit(progress_msg, text, throttler=throttler, force=True),
+                loop,
+            )
 
     await update_stage(
-        "🎧 <b>Ловлю ссылку на аудио…</b>\n"
-        "Секунду, сейчас аккуратно всё подготовлю ✨"
+        "🎵 <b>Отлично!</b>\n"
+        "Ловлю трек и готовлю аккуратную загрузку…",
+        force=True,
     )
 
     ydl_opts = {
         "format": "bestaudio/best",
+        "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
-        "socket_timeout": CONNECT_TIMEOUT,
         "noplaylist": True,
+        "socket_timeout": CONNECT_TIMEOUT,
+        "progress_hooks": [progress_hook],
+        "nopart": False,
     }
 
-    def extract():
+    def run_download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=True)
 
-    info = await loop.run_in_executor(None, extract)
+            requested = info.get("requested_downloads")
+            filepath = None
+            if requested and isinstance(requested, list):
+                filepath = requested[0].get("filepath")
 
-    title = sanitize_filename(info.get("title") or "Track")
-    direct_url = info.get("url")
-    ext = info.get("ext")
-    if not direct_url:
-        raise ValueError("Не удалось получить прямую ссылку на аудио через yt-dlp.")
+            if not filepath:
+                filepath = ydl.prepare_filename(info)
 
-    content_type = None
-    if ext:
-        ext = f".{ext.lower().lstrip('.')}"
-        if ext in ALLOWED_AUDIO_EXTENSIONS:
-            content_type = mimetypes.guess_type(f"file{ext}")[0]
+            file_path = Path(filepath)
+            artist = info.get("artist") or info.get("uploader") or info.get("creator")
+            track = info.get("track") or info.get("title")
+            title = format_track_title(artist, track, fallback=file_path.stem)
 
-    async def progress_cb(downloaded: int, total: Optional[int]):
-        if not progress_msg:
-            return
-        text = render_progress_text(title, downloaded, total, "Скачиваю трек")
-        await safe_edit(progress_msg, text, throttler=throttler)
+            return file_path, title, artist, track
 
-    downloaded = await stream_download_file(
-        direct_url,
-        output_path,
-        max_size,
-        progress_cb=progress_cb,
-    )
-    return downloaded, title, content_type
+    file_path, title, artist, track = await loop.run_in_executor(None, run_download)
+
+    if not file_path.exists():
+        raise ValueError("yt-dlp сообщил об успешной загрузке, но файл не найден.")
+
+    size = file_path.stat().st_size
+    if size <= 0:
+        raise ValueError("Скачанный файл пустой.")
+    if size < 1024:
+        raise ValueError("Скачался подозрительно маленький файл. Похоже, источник не отдал аудио.")
+    if size > max_size:
+        with contextlib.suppress(Exception):
+            file_path.unlink(missing_ok=True)
+        raise ValueError(
+            f"Файл слишком большой: {format_size(size)}. Лимит — {format_size(max_size)}."
+        )
+
+    return file_path, title, artist, track
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -393,13 +448,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        "Привет! 🎶\n\n"
-        "Я с радостью помогу достать аудио по ссылке.\n\n"
-        "Отправь мне:\n"
-        "• прямую ссылку на аудиофайл\n"
-        "• трек с SoundCloud\n"
-        "• трек с Яндекс.Музыки\n\n"
-        f"Лимит на файл: {MAX_FILE_SIZE_MB} MB 💫"
+        "Привет! 🎉\n\n"
+        "Я могу быстро достать аудио по ссылке и отправить его тебе прямо сюда 🎶\n\n"
+        "Поддерживаются:\n"
+        "• прямые ссылки на аудиофайлы\n"
+        "• SoundCloud\n"
+        "• Яндекс.Музыка\n\n"
+        f"Максимальный размер файла: {MAX_FILE_SIZE_MB} MB 💫"
     )
 
 
@@ -408,19 +463,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.message.reply_text(
-        "Вот что я умею 🎵\n\n"
-        "• прямые ссылки на аудиофайлы\n"
-        "• SoundCloud\n"
-        "• Яндекс.Музыка\n\n"
-        f"Максимальный размер файла: {MAX_FILE_SIZE_MB} MB\n\n"
-        "Просто пришли ссылку — остальное беру на себя ✨"
+        "Что я умею ✨\n\n"
+        "• скачивать аудиофайлы по прямой ссылке\n"
+        "• забирать треки из SoundCloud\n"
+        "• обрабатывать ссылки Яндекс.Музыки\n\n"
+        "Отправь ссылку — и я всё сделаю сам 🎧"
     )
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await update.message.reply_text("Я на месте и в отличном настроении 😄")
+    await update.message.reply_text("Я на месте и уже готов качать музыку 😄")
 
 
 async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -431,22 +485,21 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info("Received URL: %s", url)
 
     if not is_url(url):
-        await update.message.reply_text(
-            "Пришли, пожалуйста, ссылку формата http/https 🌷"
-        )
+        await update.message.reply_text("Пришли, пожалуйста, ссылку формата http/https 🌷")
         return
 
     semaphore: asyncio.Semaphore = context.application.bot_data["download_semaphore"]
+    performer_name = context.application.bot_data.get("performer_name", "@userbot")
 
-    if semaphore.locked() and semaphore._value == 0:
+    if semaphore.locked():
         await update.message.reply_text(
-            "Сейчас у меня уже есть несколько загрузок в работе 🙏\n"
-            "Попробуй ещё раз чуть-чуть позже."
+            "Сейчас у меня уже есть активные загрузки 🙏\n"
+            "Попробуй ещё раз чуть позже."
         )
         return
 
     status_msg = await update.message.reply_text(
-        "🎵 <b>Поехали!</b>\nСейчас посмотрю ссылку и начну загрузку…",
+        "🎵 <b>Погнали!</b>\nСейчас посмотрю ссылку и начну загрузку…",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -459,14 +512,15 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
 
             if is_direct:
                 filename = choose_filename(url, content_type)
+                pretty_title = sanitize_filename(Path(filename).stem)
+                final_title = format_track_title(None, pretty_title, fallback=pretty_title)
                 tmp_path = DOWNLOAD_DIR / f"{make_uid()}_{filename}"
-                title = sanitize_filename(Path(filename).stem)
 
                 await safe_edit(
                     status_msg,
                     (
                         f"🎶 <b>Нашёл прямой аудиофайл!</b>\n"
-                        f"<b>{html_escape(title)}</b>\n\n"
+                        f"<b>{html_escape(final_title)}</b>\n\n"
                         f"Размер: <b>{html_escape(format_size(size))}</b>\n"
                         "Начинаю скачивание 🚀"
                     ),
@@ -488,7 +542,7 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                     return
 
                 async def progress_cb(downloaded: int, total: Optional[int]):
-                    text = render_progress_text(title, downloaded, total, "Скачиваю файл")
+                    text = render_progress_text(final_title, downloaded, total, "Скачиваю файл")
                     await safe_edit(status_msg, text, throttler=throttler)
 
                 downloaded = await stream_download_file(
@@ -498,28 +552,23 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                     progress_cb=progress_cb,
                 )
 
+                if not tmp_path.exists():
+                    raise ValueError("Файл не был создан.")
+                if downloaded <= 0 or tmp_path.stat().st_size <= 0:
+                    raise ValueError("Скачанный файл пустой.")
+                if tmp_path.stat().st_size < 1024:
+                    raise ValueError("Скачался слишком маленький файл. Похоже, источник не отдал аудио.")
+
+                send_title = final_title
+
             elif is_soundcloud_url(url) or is_yandex_music_url(url):
-                filename = f"yt_{make_uid()}.m4a"
-                tmp_path = DOWNLOAD_DIR / filename
-
-                await safe_edit(
-                    status_msg,
-                    "🎧 <b>Отлично!</b>\nРаспознаю трек и готовлю загрузку…",
-                    throttler=throttler,
-                    force=True,
-                )
-
-                downloaded, title, detected_ct = await download_with_ytdlp(
+                tmp_path, send_title, artist, track = await download_with_ytdlp(
                     url,
-                    tmp_path,
+                    DOWNLOAD_DIR,
                     MAX_FILE_SIZE,
                     progress_msg=status_msg,
                 )
-                if detected_ct and tmp_path.suffix.lower() not in ALLOWED_AUDIO_EXTENSIONS:
-                    new_name = tmp_path.with_suffix(extension_from_content_type(detected_ct))
-                    with contextlib.suppress(Exception):
-                        tmp_path.rename(new_name)
-                        tmp_path = new_name
+                downloaded = tmp_path.stat().st_size
 
             else:
                 await safe_edit(
@@ -539,7 +588,7 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                 status_msg,
                 (
                     f"📤 <b>Готово, отправляю!</b>\n"
-                    f"<b>{html_escape(title)}</b>\n"
+                    f"<b>{html_escape(send_title)}</b>\n"
                     f"Размер: <b>{html_escape(format_size(downloaded))}</b>\n\n"
                     "Ещё секундочка ✨"
                 ),
@@ -553,8 +602,8 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                     await update.message.reply_audio(
                         audio=f,
                         filename=tmp_path.name,
-                        title=title,
-                        performer="Sunny Audio Bot",
+                        title=send_title,
+                        performer=performer_name,
                         read_timeout=READ_TIMEOUT,
                         write_timeout=WRITE_TIMEOUT,
                         connect_timeout=CONNECT_TIMEOUT,
@@ -568,7 +617,7 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                     await update.message.reply_document(
                         document=f,
                         filename=tmp_path.name,
-                        caption=f"🎵 {title}",
+                        caption=f"🎵 {send_title}",
                         read_timeout=READ_TIMEOUT,
                         write_timeout=WRITE_TIMEOUT,
                         connect_timeout=CONNECT_TIMEOUT,
@@ -592,7 +641,7 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                 await safe_edit(
                     status_msg,
                     (
-                        "😔 <b>Упс, что-то пошло не так.</b>\n\n"
+                        "😔 <b>Упс, не получилось обработать ссылку.</b>\n\n"
                         f"<code>{html_escape(str(e))}</code>\n\n"
                         "Попробуй ещё раз или пришли другую ссылку."
                     ),
@@ -642,6 +691,7 @@ def build_ptb_app() -> Application:
 
     app.bot_data["background_tasks"] = set()
     app.bot_data["download_semaphore"] = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+    app.bot_data["performer_name"] = f"@{BOT_USERNAME_ENV}" if BOT_USERNAME_ENV else "@userbot"
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -683,6 +733,14 @@ async def on_startup(aio_app: web.Application) -> None:
 
     logger.info("Initializing telegram application...")
     await ptb_app.initialize()
+
+    try:
+        me = await ptb_app.bot.get_me()
+        if me.username:
+            ptb_app.bot_data["performer_name"] = f"@{me.username}"
+            logger.info("Resolved bot username: %s", ptb_app.bot_data["performer_name"])
+    except Exception:
+        logger.exception("Failed to resolve bot username, using fallback")
 
     logger.info("Starting telegram application...")
     await ptb_app.start()
