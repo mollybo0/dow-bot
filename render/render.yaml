@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: audio-direct-link-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      - key: MAX_FILE_SIZE_MB
+        value: "48"
+      - key: PYTHON_VERSION
+        value: "3.11.11"
