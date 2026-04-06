@@ -2,7 +2,6 @@ import os
 import re
 import asyncio
 import logging
-import tempfile
 import urllib.parse
 from pathlib import Path
 from uuid import uuid4
@@ -20,11 +19,14 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-# =========================================================
-# CONFIG
-# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("render-audio-bot")
+
 BOT_TOKEN = os.getenv("8459100080:AAHfqLlNhfhdy4B09q_2ZH-8AP0DWN6I-wQ", "").strip()
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+RENDER_EXTERNAL_URL = os.getenv("https://dashboard.render.com/web/srv-d79ugs0ule4c73avfr6g/events", "").strip().rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "48"))
@@ -42,18 +44,7 @@ ALLOWED_AUDIO_EXTENSIONS = {
     ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus"
 }
 
-if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения.")
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("audio_bot")
-
-# =========================================================
-# HELPERS
-# =========================================================
 def sanitize_filename(name: str, max_len: int = 120) -> str:
     if not name:
         return "audio"
@@ -99,10 +90,8 @@ def choose_filename_from_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     raw_name = Path(parsed.path).name
     raw_name = sanitize_filename(raw_name or f"audio_{make_uid()}.mp3")
-
     if not Path(raw_name).suffix:
         raw_name += ".mp3"
-
     return raw_name
 
 
@@ -113,7 +102,7 @@ async def safe_edit(msg, text: str) -> None:
         pass
 
 
-async def fetch_head_info(url: str) -> tuple[int | None, str | None]:
+async def fetch_head_info(url: str):
     timeout = httpx.Timeout(
         connect=CONNECT_TIMEOUT,
         read=READ_TIMEOUT,
@@ -167,31 +156,18 @@ async def stream_download_file(url: str, output_path: Path, max_size: int) -> in
     return downloaded
 
 
-# =========================================================
-# BOT COMMANDS
-# =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Привет.\n\n"
-        "Я принимаю только прямые ссылки на аудиофайлы:\n"
-        "mp3, m4a, aac, ogg, wav, flac, opus.\n\n"
-        "Просто отправь ссылку.\n"
-        "Команды:\n"
-        "/start — запуск\n"
-        "/help — помощь\n"
-        "/ping — проверка"
+        "Отправь прямую ссылку на аудиофайл:\n"
+        "mp3, m4a, aac, ogg, wav, flac, opus."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Что умеет бот:\n"
-        "- принимает прямую ссылку на аудиофайл;\n"
-        "- скачивает файл потоком на диск;\n"
-        "- отправляет аудио обратно в Telegram.\n\n"
-        f"Текущий лимит файла: {MAX_FILE_SIZE_MB} MB.\n\n"
-        "Пример ссылки:\n"
-        "https://example.com/music/song.mp3"
+        f"Поддерживаются только прямые ссылки на аудиофайлы.\n"
+        f"Лимит файла: {MAX_FILE_SIZE_MB} MB."
     )
 
 
@@ -199,9 +175,6 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong")
 
 
-# =========================================================
-# MESSAGE HANDLER
-# =========================================================
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -222,30 +195,26 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     status_msg = await update.message.reply_text("🔍 Проверяю ссылку...")
 
     try:
-        size, content_type = await fetch_head_info(url)
-
+        size, _ = await fetch_head_info(url)
         if size is not None and size > MAX_FILE_SIZE:
             await safe_edit(
                 status_msg,
-                (
-                    f"❌ Файл слишком большой: *{escape_md(format_size(size))}*\n\n"
-                    f"Лимит: *{escape_md(format_size(MAX_FILE_SIZE))}*"
-                ),
+                f"❌ Файл слишком большой: *{escape_md(format_size(size))}*\n\n"
+                f"Лимит: *{escape_md(format_size(MAX_FILE_SIZE))}*",
             )
             return
 
         filename = choose_filename_from_url(url)
-        tmp_name = f"{make_uid()}_{filename}"
-        tmp_path = DOWNLOAD_DIR / tmp_name
+        tmp_path = DOWNLOAD_DIR / f"{make_uid()}_{filename}"
 
         await safe_edit(status_msg, "⏳ Скачиваю файл...")
-
         downloaded = await stream_download_file(url, tmp_path, MAX_FILE_SIZE)
 
         title = sanitize_filename(Path(filename).stem)
         await safe_edit(
             status_msg,
-            f"📤 Отправляю: *{escape_md(title)}*\n\nРазмер: *{escape_md(format_size(downloaded))}*"
+            f"📤 Отправляю: *{escape_md(title)}*\n\n"
+            f"Размер: *{escape_md(format_size(downloaded))}*"
         )
 
         try:
@@ -270,27 +239,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
 
-    except httpx.HTTPStatusError as e:
-        logger.exception("HTTP status error")
-        await safe_edit(
-            status_msg,
-            f"❌ Ошибка HTTP: *{escape_md(str(e.response.status_code))}*"
-        )
-    except ValueError as e:
-        logger.exception("Validation error")
-        await safe_edit(status_msg, f"❌ {escape_md(str(e))}")
     except Exception as e:
-        logger.exception("Unexpected error")
+        logger.exception("handle_link error")
         await safe_edit(status_msg, f"❌ Ошибка: `{escape_md(str(e))}`")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception", exc_info=context.error)
+    logger.exception("Unhandled bot exception", exc_info=context.error)
 
 
-# =========================================================
-# APP FACTORY
-# =========================================================
 def build_ptb_app() -> Application:
     request = HTTPXRequest(
         connection_pool_size=8,
@@ -314,53 +271,53 @@ def build_ptb_app() -> Application:
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_error_handler(error_handler)
-
     return app
 
 
-# =========================================================
-# AIOHTTP WEBHOOK SERVER
-# =========================================================
 async def health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
 async def telegram_webhook(request: web.Request) -> web.Response:
-    app: Application = request.app["ptb_app"]
-
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
-
+    ptb_app: Application = request.app["ptb_app"]
+    data = await request.json()
+    update = Update.de_json(data, ptb_app.bot)
+    await ptb_app.process_update(update)
     return web.json_response({"ok": True})
 
 
 async def on_startup(aio_app: web.Application) -> None:
-    ptb_app: Application = aio_app["ptb_app"]
+    logger.info("Starting app...")
+    logger.info("PORT=%s", PORT)
+    logger.info("BOT_TOKEN set=%s", bool(BOT_TOKEN))
+    logger.info("RENDER_EXTERNAL_URL=%s", RENDER_EXTERNAL_URL or "<empty>")
 
-    await ptb_app.initialize()
-    await ptb_app.start()
-
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN в переменных окружения.")
     if not RENDER_EXTERNAL_URL:
         raise RuntimeError("Не задан RENDER_EXTERNAL_URL в переменных окружения.")
 
+    ptb_app: Application = aio_app["ptb_app"]
+
+    logger.info("Initializing telegram application...")
+    await ptb_app.initialize()
+
+    logger.info("Starting telegram application...")
+    await ptb_app.start()
+
     webhook_url = f"{RENDER_EXTERNAL_URL}/telegram"
+    logger.info("Setting webhook to %s", webhook_url)
     await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    logger.info("Webhook set to %s", webhook_url)
+    logger.info("Webhook set successfully")
 
 
 async def on_shutdown(aio_app: web.Application) -> None:
+    logger.info("Shutting down...")
     ptb_app: Application = aio_app["ptb_app"]
-
     try:
         await ptb_app.bot.delete_webhook()
     except Exception:
-        logger.exception("Failed to delete webhook")
-
+        logger.exception("Failed deleting webhook")
     await ptb_app.stop()
     await ptb_app.shutdown()
 
@@ -368,21 +325,20 @@ async def on_shutdown(aio_app: web.Application) -> None:
 def create_web_app() -> web.Application:
     aio_app = web.Application()
     aio_app["ptb_app"] = build_ptb_app()
-
     aio_app.router.add_get("/", health)
     aio_app.router.add_get("/health", health)
     aio_app.router.add_post("/telegram", telegram_webhook)
-
     aio_app.on_startup.append(on_startup)
     aio_app.on_shutdown.append(on_shutdown)
-
     return aio_app
 
 
-# =========================================================
-# MAIN
-# =========================================================
 if __name__ == "__main__":
-    web_app = create_web_app()
-    web.run_app(web_app, host="0.0.0.0", port=PORT)
-    
+    try:
+        logger.info("Booting service...")
+        app = create_web_app()
+        logger.info("Running aiohttp on 0.0.0.0:%s", PORT)
+        web.run_app(app, host="0.0.0.0", port=PORT)
+    except Exception:
+        logger.exception("Fatal startup error")
+        raise
