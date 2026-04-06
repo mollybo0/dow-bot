@@ -8,10 +8,9 @@ from uuid import uuid4
 
 import httpx
 from aiohttp import web
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -25,13 +24,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("render-audio-bot")
-logger.info("Booting service... v2")  # <-- здесь уже logger есть
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("render-audio-bot")
+logger.info("Booting service... v2")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
@@ -176,7 +169,7 @@ async def stream_download_file(url: str, output_path: Path, max_size: int) -> in
 async def download_with_ytdlp(url: str, output_path: Path, max_size: int) -> tuple[int, str]:
     """
     Универсальный загрузчик для SoundCloud / Яндекс.Музыки через yt-dlp.
-    yt-dlp сам разруливает форматы и API этих сервисов.
+    yt-dlp сам разруливает форматы и API сервисов.
     """
     ydl_opts = {
         "format": "bestaudio/best",
@@ -316,12 +309,16 @@ def build_ptb_app() -> Application:
         pool_timeout=POOL_TIMEOUT,
     )
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .request(request)
-        # НИЧЕГО больше тут не добавляем, особенно .get_updates_request()
-        .build()
+    # Ручная сборка Application без Updater / ApplicationBuilder.build()
+    bot = Bot(token=BOT_TOKEN, request=request)
+    app = Application(
+        bot=bot,
+        update_queue=None,
+        persistence=None,
+        arbitrary_callback_data=False,
+        context_types=ContextTypes.DEFAULT_TYPE,
+        post_init=None,
+        request=request,
     )
 
     app.add_handler(CommandHandler("start", start))
