@@ -8,7 +8,7 @@ import mimetypes
 import time
 from pathlib import Path
 from uuid import uuid4
-from typing import Optional, Tuple, Set
+from typing import Optional, Tuple, Set, Dict
 
 import httpx
 from aiohttp import web
@@ -31,7 +31,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("render-audio-bot")
-logger.info("Booting service... final")
+logger.info("Booting service... final-stable")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
@@ -347,15 +347,11 @@ async def download_with_ytdlp(
     output_dir: Path,
     max_size: int,
     progress_msg=None,
-) -> Tuple[Path, str, Optional[str], Optional[str]]:
+) -> Tuple[Path, str]:
     loop = asyncio.get_running_loop()
     throttler = ProgressThrottler(PROGRESS_EDIT_INTERVAL)
     uid = make_uid()
     outtmpl = str(output_dir / f"{uid}.%(ext)s")
-
-    async def update_stage(text: str, force: bool = False):
-        if progress_msg:
-            await safe_edit(progress_msg, text, throttler=throttler, force=force)
 
     def progress_hook(d):
         if not progress_msg:
@@ -387,12 +383,6 @@ async def download_with_ytdlp(
                 loop,
             )
 
-    await update_stage(
-        "🎵 <b>Отлично!</b>\n"
-        "Ловлю трек и готовлю аккуратную загрузку…",
-        force=True,
-    )
-
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -405,25 +395,33 @@ async def download_with_ytdlp(
     }
 
     def run_download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-            requested = info.get("requested_downloads")
-            filepath = None
-            if requested and isinstance(requested, list):
-                filepath = requested[0].get("filepath")
+                requested = info.get("requested_downloads")
+                filepath = None
+                if requested and isinstance(requested, list):
+                    filepath = requested[0].get("filepath")
 
-            if not filepath:
-                filepath = ydl.prepare_filename(info)
+                if not filepath:
+                    filepath = ydl.prepare_filename(info)
 
-            file_path = Path(filepath)
-            artist = info.get("artist") or info.get("uploader") or info.get("creator")
-            track = info.get("track") or info.get("title")
-            title = format_track_title(artist, track, fallback=file_path.stem)
+                file_path = Path(filepath)
+                artist = info.get("artist") or info.get("uploader") or info.get("creator")
+                track = info.get("track") or info.get("title")
+                title = format_track_title(artist, track, fallback=file_path.stem)
 
-            return file_path, title, artist, track
+                return file_path, title
+        except Exception as e:
+            msg = str(e)
+            if "HTTP Error 451" in msg or "Unavailable For Legal Reasons" in msg:
+                raise ValueError(
+                    "Этот трек недоступен из текущего региона сервера или ограничен правообладателем."
+                )
+            raise
 
-    file_path, title, artist, track = await loop.run_in_executor(None, run_download)
+    file_path, title = await loop.run_in_executor(None, run_download)
 
     if not file_path.exists():
         raise ValueError("yt-dlp сообщил об успешной загрузке, но файл не найден.")
@@ -440,7 +438,7 @@ async def download_with_ytdlp(
             f"Файл слишком большой: {format_size(size)}. Лимит — {format_size(max_size)}."
         )
 
-    return file_path, title, artist, track
+    return file_path, title
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -449,11 +447,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "Привет! 🎉\n\n"
-        "Я могу быстро достать аудио по ссылке и отправить его тебе прямо сюда 🎶\n\n"
+        "Я могу скачать аудио по ссылке и отправить его прямо сюда 🎶\n\n"
         "Поддерживаются:\n"
         "• прямые ссылки на аудиофайлы\n"
         "• SoundCloud\n"
         "• Яндекс.Музыка\n\n"
+        "Команды:\n"
+        "/status — показать статус\n"
+        "/cancel — отменить текущую загрузку\n\n"
         f"Максимальный размер файла: {MAX_FILE_SIZE_MB} MB 💫"
     )
 
@@ -467,6 +468,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• скачивать аудиофайлы по прямой ссылке\n"
         "• забирать треки из SoundCloud\n"
         "• обрабатывать ссылки Яндекс.Музыки\n\n"
+        "Команды:\n"
+        "/status — статус текущей загрузки\n"
+        "/cancel — отмена загрузки\n\n"
         "Отправь ссылку — и я всё сделаю сам 🎧"
     )
 
@@ -477,8 +481,35 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Я на месте и уже готов качать музыку 😄")
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.message:
+        return
+
+    chat_id = update.effective_chat.id
+    active_jobs: Dict[int, asyncio.Task] = context.application.bot_data["active_chat_jobs"]
+    if chat_id in active_jobs and not active_jobs[chat_id].done():
+        await update.message.reply_text("Сейчас в этом чате идёт загрузка 🎵")
+    else:
+        await update.message.reply_text("Сейчас этот чат свободен, можно отправлять ссылку ✨")
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.message:
+        return
+
+    chat_id = update.effective_chat.id
+    active_jobs: Dict[int, asyncio.Task] = context.application.bot_data["active_chat_jobs"]
+    task = active_jobs.get(chat_id)
+
+    if task and not task.done():
+        task.cancel()
+        await update.message.reply_text("Окей, отменил текущую загрузку 🛑")
+    else:
+        await update.message.reply_text("Сейчас в этом чате нет активной загрузки 🙂")
+
+
 async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
+    if not update.message or not update.message.text or not update.effective_chat:
         return
 
     url = update.message.text.strip()
@@ -490,13 +521,6 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
 
     semaphore: asyncio.Semaphore = context.application.bot_data["download_semaphore"]
     performer_name = context.application.bot_data.get("performer_name", "@userbot")
-
-    if semaphore.locked():
-        await update.message.reply_text(
-            "Сейчас у меня уже есть активные загрузки 🙏\n"
-            "Попробуй ещё раз чуть позже."
-        )
-        return
 
     status_msg = await update.message.reply_text(
         "🎵 <b>Погнали!</b>\nСейчас посмотрю ссылку и начну загрузку…",
@@ -562,7 +586,7 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                 send_title = final_title
 
             elif is_soundcloud_url(url) or is_yandex_music_url(url):
-                tmp_path, send_title, artist, track = await download_with_ytdlp(
+                tmp_path, send_title = await download_with_ytdlp(
                     url,
                     DOWNLOAD_DIR,
                     MAX_FILE_SIZE,
@@ -631,7 +655,7 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
             with contextlib.suppress(Exception):
                 await safe_edit(
                     status_msg,
-                    "⚠️ Загрузка была остановлена из-за перезапуска сервиса.",
+                    "🛑 <b>Загрузка отменена.</b>\nМожно отправлять новую ссылку.",
                     force=True,
                 )
             raise
@@ -641,8 +665,8 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
                 await safe_edit(
                     status_msg,
                     (
-                        "😔 <b>Упс, не получилось обработать ссылку.</b>\n\n"
-                        f"<code>{html_escape(str(e))}</code>\n\n"
+                        "😔 <b>Не получилось обработать ссылку.</b>\n\n"
+                        f"{html_escape(str(e))}\n\n"
                         "Попробуй ещё раз или пришли другую ссылку."
                     ),
                     throttler=throttler,
@@ -655,15 +679,36 @@ async def process_audio_request(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.message:
+        return
+
     app = context.application
+    chat_id = update.effective_chat.id
+
+    active_jobs: Dict[int, asyncio.Task] = app.bot_data["active_chat_jobs"]
+    current = active_jobs.get(chat_id)
+    if current and not current.done():
+        await update.message.reply_text(
+            "В этом чате уже идёт загрузка 🎵\n"
+            "Дождись завершения или нажми /cancel"
+        )
+        return
+
     task = asyncio.create_task(process_audio_request(update, context))
     tasks: Set[asyncio.Task] = app.bot_data["background_tasks"]
+
+    active_jobs[chat_id] = task
     tasks.add(task)
 
     def _cleanup(t: asyncio.Task):
         tasks.discard(t)
-        with contextlib.suppress(Exception):
+        existing = active_jobs.get(chat_id)
+        if existing is t:
+            active_jobs.pop(chat_id, None)
+        with contextlib.suppress(asyncio.CancelledError):
             t.result()
+        with contextlib.suppress(Exception):
+            logger.exception("Background task failed")
 
     task.add_done_callback(_cleanup)
 
@@ -690,12 +735,16 @@ def build_ptb_app() -> Application:
     )
 
     app.bot_data["background_tasks"] = set()
+    app.bot_data["active_chat_jobs"] = {}
+    app.bot_data["webhook_tasks"] = set()
     app.bot_data["download_semaphore"] = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
     app.bot_data["performer_name"] = f"@{BOT_USERNAME_ENV}" if BOT_USERNAME_ENV else "@userbot"
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_error_handler(error_handler)
     return app
@@ -703,8 +752,16 @@ def build_ptb_app() -> Application:
 
 async def health(request: web.Request) -> web.Response:
     app: web.Application = request.app
-    bg_tasks = len(app["ptb_app"].bot_data.get("background_tasks", set()))
-    return web.json_response({"ok": True, "background_tasks": bg_tasks})
+    ptb_app: Application = app["ptb_app"]
+    bg_tasks = len(ptb_app.bot_data.get("background_tasks", set()))
+    active_jobs = len(ptb_app.bot_data.get("active_chat_jobs", {}))
+    return web.json_response(
+        {
+            "ok": True,
+            "background_tasks": bg_tasks,
+            "active_chat_jobs": active_jobs,
+        }
+    )
 
 
 async def telegram_webhook(request: web.Request) -> web.Response:
@@ -713,7 +770,19 @@ async def telegram_webhook(request: web.Request) -> web.Response:
     update = Update.de_json(data, ptb_app.bot)
 
     logger.info("Webhook update received")
-    asyncio.create_task(ptb_app.process_update(update))
+    task = asyncio.create_task(ptb_app.process_update(update))
+
+    webhook_tasks: Set[asyncio.Task] = ptb_app.bot_data["webhook_tasks"]
+    webhook_tasks.add(task)
+
+    def _cleanup(t: asyncio.Task):
+        webhook_tasks.discard(t)
+        with contextlib.suppress(asyncio.CancelledError):
+            t.result()
+        with contextlib.suppress(Exception):
+            logger.exception("Webhook task failed")
+
+    task.add_done_callback(_cleanup)
 
     return web.json_response({"ok": True})
 
@@ -755,12 +824,15 @@ async def on_shutdown(aio_app: web.Application) -> None:
     logger.info("Shutting down...")
     ptb_app: Application = aio_app["ptb_app"]
 
-    tasks: Set[asyncio.Task] = ptb_app.bot_data.get("background_tasks", set())
-    if tasks:
-        logger.info("Cancelling %s background task(s)", len(tasks))
-        for task in list(tasks):
+    all_tasks = set()
+    all_tasks.update(ptb_app.bot_data.get("background_tasks", set()))
+    all_tasks.update(ptb_app.bot_data.get("webhook_tasks", set()))
+
+    if all_tasks:
+        logger.info("Cancelling %s task(s)", len(all_tasks))
+        for task in list(all_tasks):
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*all_tasks, return_exceptions=True)
 
     with contextlib.suppress(Exception):
         await ptb_app.bot.delete_webhook()
