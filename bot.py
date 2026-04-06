@@ -20,6 +20,8 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 import yt_dlp  # не забудь добавить в requirements.txt
 
+logger.info("Booting service... v2")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
