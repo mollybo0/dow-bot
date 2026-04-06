@@ -18,7 +18,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-import yt_dlp  # нужен в requirements.txt
+import yt_dlp  # не забудь добавить в requirements.txt
 
 logging.basicConfig(
     level=logging.INFO,
@@ -169,9 +169,8 @@ async def stream_download_file(url: str, output_path: Path, max_size: int) -> in
 async def download_with_ytdlp(url: str, output_path: Path, max_size: int) -> tuple[int, str]:
     """
     Универсальный загрузчик для SoundCloud / Яндекс.Музыки через yt-dlp.
-    yt-dlp сам разруливает все форматы и API обоих сервисов.
+    yt-dlp сам разруливает форматы и API этих сервисов.
     """
-    # yt-dlp сам скачивает в файл, но мы хотим контроль размера → качаем по direct-url через httpx
     ydl_opts = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -338,7 +337,7 @@ async def telegram_webhook(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def on_startup(aio_app: web.Application) -> web.Response:
+async def on_startup(aio_app: web.Application) -> None:
     logger.info("Starting app...")
     logger.info("PORT=%s", PORT)
     logger.info("BOT_TOKEN set=%s", bool(BOT_TOKEN))
@@ -361,10 +360,9 @@ async def on_startup(aio_app: web.Application) -> web.Response:
     logger.info("Setting webhook to %s", webhook_url)
     await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
     logger.info("Webhook set successfully")
-    return web.json_response({"ok": True})
 
 
-async def on_shutdown(aio_app: web.Application) -> web.Response:
+async def on_shutdown(aio_app: web.Application) -> None:
     logger.info("Shutting down...")
     ptb_app: Application = aio_app["ptb_app"]
     try:
@@ -373,7 +371,6 @@ async def on_shutdown(aio_app: web.Application) -> web.Response:
         logger.exception("Failed deleting webhook")
     await ptb_app.stop()
     await ptb_app.shutdown()
-    return web.json_response({"ok": True})
 
 
 def create_web_app() -> web.Application:
