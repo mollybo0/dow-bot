@@ -1,4 +1,4 @@
 python-telegram-bot[webhooks]==20.8
 aiohttp
 httpx
-yt-dlp [][]
+yt-dlp
